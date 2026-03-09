@@ -131,11 +131,30 @@ class RuleDetailWidget(QWidget):
             agg = params.get("aggType", "count")
             agg_field = params.get("aggField", "")
             lines.append(f"<b>Aggregation:</b> {agg}({agg_field or '*'})")
+        elif rule.rule_type == "metrics.alert.threshold":
+            criteria = rule.criteria
+            for i, c in enumerate(criteria):
+                metric = c.get("metric", "custom")
+                agg = c.get("aggType", "avg")
+                lines.append(f"<b>Criterion {i+1}:</b> {agg}({metric})")
+            filter_text = params.get("filterQueryText", "")
+            if filter_text:
+                lines.append(f"<b>Filter:</b> {filter_text}")
+        elif rule.rule_type == "logs.alert.document.count":
+            criteria = rule.criteria
+            for i, c in enumerate(criteria):
+                field = c.get("field", "")
+                cmp = c.get("comparator", "")
+                val = c.get("value", "")
+                lines.append(f"<b>Criterion {i+1}:</b> {field} {cmp} {val}")
 
         tw = params.get("timeWindowSize")
         tu = params.get("timeWindowUnit")
         if tw and tu:
             lines.append(f"<b>Time Window:</b> {tw} {tu}")
+        elif rule.time_window_seconds:
+            mins = rule.time_window_seconds // 60
+            lines.append(f"<b>Time Window:</b> {mins} minutes")
 
         self.info_text.setHtml("<br>".join(lines))
 

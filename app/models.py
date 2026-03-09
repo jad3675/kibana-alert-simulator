@@ -54,6 +54,13 @@ class Rule:
         }
         return type_map.get(self.rule_type, self.rule_type)
 
+    # Default indices for rule types that don't store index in params
+    DEFAULT_INDICES = {
+        "metrics.alert.threshold": ["metrics-*", "metricbeat-*"],
+        "metrics.alert.inventory.threshold": ["metrics-*", "metricbeat-*"],
+        "logs.alert.document.count": ["logs-*", "filebeat-*"],
+    }
+
     @property
     def indices(self) -> list[str]:
         params = self.params
@@ -64,10 +71,27 @@ class Rule:
             sc = params["searchConfiguration"]
             if "index" in sc:
                 return [sc["index"]] if isinstance(sc["index"], str) else [sc["index"]]
-        return []
+        # Fallback defaults for rule types that use source config instead of explicit index
+        return self.DEFAULT_INDICES.get(self.rule_type, [])
+
+    @property
+    def criteria(self) -> list[dict]:
+        """Extract criteria array for metrics/logs rules."""
+        return self.params.get("criteria", [])
 
     @property
     def threshold_info(self) -> tuple[str, list[float]]:
+        # For metrics.alert.threshold, threshold lives inside criteria
+        if self.rule_type in ("metrics.alert.threshold", "logs.alert.document.count"):
+            criteria = self.criteria
+            if criteria:
+                c = criteria[0]
+                comparator = c.get("comparator", ">")
+                threshold = c.get("threshold", [0])
+                if not isinstance(threshold, list):
+                    threshold = [threshold]
+                return comparator, threshold
+
         comparator = self.params.get("thresholdComparator", ">")
         threshold = self.params.get("threshold", [0])
         if not isinstance(threshold, list):
@@ -76,13 +100,26 @@ class Rule:
 
     @property
     def time_window_seconds(self) -> int | None:
+        # Standard fields
         size = self.params.get("timeWindowSize")
         unit = self.params.get("timeWindowUnit")
-        if size is None or unit is None:
-            return None
-        size = int(size)
-        multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400}
-        return size * multipliers.get(unit, 60)
+        if size is not None and unit is not None:
+            size = int(size)
+            multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+            return size * multipliers.get(unit, 60)
+
+        # For metrics.alert.threshold, time window is in criteria
+        if self.rule_type == "metrics.alert.threshold":
+            criteria = self.criteria
+            if criteria:
+                c = criteria[0]
+                ts = c.get("timeSize")
+                tu = c.get("timeUnit")
+                if ts is not None and tu is not None:
+                    multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+                    return int(ts) * multipliers.get(tu, 60)
+
+        return None
 
 
 @dataclass

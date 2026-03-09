@@ -37,6 +37,10 @@ class RuleSimulator:
             return self._simulate_es_query(rule, host_name, time_range_seconds)
         elif rule_type == ".index-threshold":
             return self._simulate_index_threshold(rule, host_name, time_range_seconds)
+        elif rule_type == "metrics.alert.threshold":
+            return self._simulate_metrics_threshold(rule, host_name, time_range_seconds)
+        elif rule_type == "logs.alert.document.count":
+            return self._simulate_logs_document_count(rule, host_name, time_range_seconds)
         else:
             return self._simulate_generic(rule, host_name, time_range_seconds)
 
@@ -145,6 +149,140 @@ class RuleSimulator:
                 rule=rule, fired=False, total_match_count=0,
                 threshold=thresholds, comparator=comparator,
                 error=str(e),
+            )
+
+    def _simulate_metrics_threshold(
+        self, rule: Rule, host_name: str | None, time_range_seconds: int
+    ) -> SimulationResult:
+        """Simulate metrics.alert.threshold rules.
+
+        These rules have criteria like:
+        [{"metric": "system.cpu.user.pct", "comparator": ">",
+          "threshold": [0.9], "aggType": "avg", "timeSize": 5, "timeUnit": "m"}]
+        """
+        params = rule.params
+        indices = rule.indices
+        criteria = rule.criteria
+        comparator, thresholds = rule.threshold_info
+        filter_query_text = params.get("filterQueryText", "")
+
+        if not indices:
+            return SimulationResult(
+                rule=rule, fired=False, total_match_count=0,
+                threshold=thresholds, comparator=comparator,
+                error="No indices found for metrics threshold rule.",
+            )
+
+        if not criteria:
+            return SimulationResult(
+                rule=rule, fired=False, total_match_count=0,
+                threshold=thresholds, comparator=comparator,
+                error="No criteria defined in this rule.",
+            )
+
+        # Use the first criterion for simulation
+        criterion = criteria[0]
+        metric_field = criterion.get("metric", "")
+        agg_type = criterion.get("aggType", "avg")
+        # "custom" metric means use aggField, otherwise metric IS the field
+        if metric_field == "custom":
+            agg_field = criterion.get("customMetrics", [{}])[0].get("field", "")
+            agg_type = criterion.get("customMetrics", [{}])[0].get("aggType", "avg")
+        else:
+            agg_field = metric_field
+
+        # Build filter query from filterQueryText (KQL)
+        base_query = {}
+        if filter_query_text:
+            base_query = {"query_string": {"query": filter_query_text}}
+
+        try:
+            if host_name:
+                result = self.client.execute_agg_query(
+                    indices=indices,
+                    query=base_query,
+                    agg_type=agg_type,
+                    agg_field=agg_field,
+                    time_range_seconds=time_range_seconds,
+                    host_filter=host_name,
+                    group_by_host=False,
+                )
+                value = self._extract_metric_value(result, agg_type)
+                fired = self._check_threshold(value, comparator, thresholds)
+                return SimulationResult(
+                    rule=rule, fired=fired, total_match_count=value,
+                    threshold=thresholds, comparator=comparator,
+                    device_results=[DeviceResult(host_name, value, fired)],
+                    time_range_start=result["time_start"],
+                    time_range_end=result["time_end"],
+                    query_used=result["query"],
+                )
+            else:
+                result = self.client.execute_agg_query(
+                    indices=indices,
+                    query=base_query,
+                    agg_type=agg_type,
+                    agg_field=agg_field,
+                    time_range_seconds=time_range_seconds,
+                    group_by_host=True,
+                )
+                return self._build_host_results(
+                    rule, result, agg_type, comparator, thresholds,
+                )
+        except Exception as e:
+            return SimulationResult(
+                rule=rule, fired=False, total_match_count=0,
+                threshold=thresholds, comparator=comparator,
+                error=str(e),
+            )
+
+    def _simulate_logs_document_count(
+        self, rule: Rule, host_name: str | None, time_range_seconds: int
+    ) -> SimulationResult:
+        """Simulate logs.alert.document.count rules.
+
+        These count log documents matching criteria and compare against threshold.
+        """
+        indices = rule.indices
+        comparator, thresholds = rule.threshold_info
+        criteria = rule.criteria
+
+        if not indices:
+            return SimulationResult(
+                rule=rule, fired=False, total_match_count=0,
+                threshold=thresholds, comparator=comparator,
+                error="No indices found for log document count rule.",
+            )
+
+        # Build a bool query from criteria (each criterion is a filter)
+        must_clauses = []
+        for c in criteria:
+            field = c.get("field", "")
+            value = c.get("value")
+            cmp = c.get("comparator", "more than")
+            if field and value is not None:
+                if cmp in ("equals", "does not equal"):
+                    clause = {"term": {field: value}}
+                    if cmp == "does not equal":
+                        clause = {"bool": {"must_not": [{"term": {field: value}}]}}
+                    must_clauses.append(clause)
+                elif cmp in ("matches", "does not match"):
+                    clause = {"match": {field: value}}
+                    if cmp == "does not match":
+                        clause = {"bool": {"must_not": [{"match": {field: value}}]}}
+                    must_clauses.append(clause)
+
+        base_query = {"bool": {"must": must_clauses}} if must_clauses else {}
+
+        if host_name:
+            return self._simulate_single_host(
+                rule, indices, base_query, comparator, thresholds,
+                host_name, time_range_seconds,
+            )
+        else:
+            return self._simulate_all_hosts(
+                rule, indices, base_query, comparator, thresholds,
+                time_range_seconds,
             )
 
     def _simulate_generic(
