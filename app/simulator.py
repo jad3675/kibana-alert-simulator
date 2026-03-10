@@ -20,10 +20,9 @@ class RuleSimulator:
         self.client = client
 
     def _resolve_overrides(self, rule: Rule, overrides: SimulationOverrides | None):
-        """Return (comparator, thresholds, filter_query, indices) with overrides applied."""
+        """Return (comparator, thresholds, filter_query) with overrides applied."""
         comparator, thresholds = rule.threshold_info
         filter_query = None
-        indices = rule.indices
 
         if overrides:
             if overrides.comparator is not None:
@@ -32,10 +31,8 @@ class RuleSimulator:
                 thresholds = overrides.threshold
             if overrides.filter_query is not None:
                 filter_query = overrides.filter_query
-            if overrides.indices is not None:
-                indices = overrides.indices
 
-        return comparator, thresholds, filter_query, indices
+        return comparator, thresholds, filter_query
 
     def _build_filter_query(self, filter_text: str) -> dict:
         """Convert a KQL/query_string filter into an ES query clause."""
@@ -61,26 +58,29 @@ class RuleSimulator:
         host_name: str | None = None,
         time_range_seconds: int | None = None,
         overrides: SimulationOverrides | None = None,
+        indices_override: list[str] | None = None,
     ) -> SimulationResult:
         """
         Simulate a rule. If host_name is None, simulates against all devices.
         Overrides allow what-if testing without modifying the real rule.
+        indices_override replaces the rule's indices with a global data source.
         """
         if time_range_seconds is None:
             time_range_seconds = rule.time_window_seconds or rule.interval_seconds
 
         rule_type = rule.rule_type
+        idx = indices_override  # shorthand, passed through to sub-methods
 
         if rule_type == ".es-query":
-            result = self._simulate_es_query(rule, host_name, time_range_seconds, overrides)
+            result = self._simulate_es_query(rule, host_name, time_range_seconds, overrides, idx)
         elif rule_type == ".index-threshold":
-            result = self._simulate_index_threshold(rule, host_name, time_range_seconds, overrides)
+            result = self._simulate_index_threshold(rule, host_name, time_range_seconds, overrides, idx)
         elif rule_type == "metrics.alert.threshold":
-            result = self._simulate_metrics_threshold(rule, host_name, time_range_seconds, overrides)
+            result = self._simulate_metrics_threshold(rule, host_name, time_range_seconds, overrides, idx)
         elif rule_type == "logs.alert.document.count":
-            result = self._simulate_logs_document_count(rule, host_name, time_range_seconds, overrides)
+            result = self._simulate_logs_document_count(rule, host_name, time_range_seconds, overrides, idx)
         else:
-            result = self._simulate_generic(rule, host_name, time_range_seconds, overrides)
+            result = self._simulate_generic(rule, host_name, time_range_seconds, overrides, idx)
 
         if overrides is not None:
             result.has_overrides = True
@@ -89,9 +89,11 @@ class RuleSimulator:
     def _simulate_es_query(
         self, rule: Rule, host_name: str | None, time_range_seconds: int,
         overrides: SimulationOverrides | None = None,
+        indices_override: list[str] | None = None,
     ) -> SimulationResult:
         params = rule.params
-        comparator, thresholds, filter_override, indices = self._resolve_overrides(rule, overrides)
+        comparator, thresholds, filter_override = self._resolve_overrides(rule, overrides)
+        indices = indices_override or rule.indices
 
         # Extract the ES query from the rule
         es_query = {}
@@ -139,9 +141,11 @@ class RuleSimulator:
     def _simulate_index_threshold(
         self, rule: Rule, host_name: str | None, time_range_seconds: int,
         overrides: SimulationOverrides | None = None,
+        indices_override: list[str] | None = None,
     ) -> SimulationResult:
         params = rule.params
-        comparator, thresholds, filter_override, indices = self._resolve_overrides(rule, overrides)
+        comparator, thresholds, filter_override = self._resolve_overrides(rule, overrides)
+        indices = indices_override or rule.indices
         agg_type = params.get("aggType", "count")
         agg_field = params.get("aggField")
         term_field = params.get("termField")
@@ -200,15 +204,12 @@ class RuleSimulator:
     def _simulate_metrics_threshold(
         self, rule: Rule, host_name: str | None, time_range_seconds: int,
         overrides: SimulationOverrides | None = None,
+        indices_override: list[str] | None = None,
     ) -> SimulationResult:
-        """Simulate metrics.alert.threshold rules.
-
-        These rules have criteria like:
-        [{"metric": "system.cpu.user.pct", "comparator": ">",
-          "threshold": [0.9], "aggType": "avg", "timeSize": 5, "timeUnit": "m"}]
-        """
+        """Simulate metrics.alert.threshold rules."""
         params = rule.params
-        comparator, thresholds, filter_override, indices = self._resolve_overrides(rule, overrides)
+        comparator, thresholds, filter_override = self._resolve_overrides(rule, overrides)
+        indices = indices_override or rule.indices
         criteria = rule.criteria
         filter_query_text = params.get("filterQueryText", "")
 
@@ -226,18 +227,15 @@ class RuleSimulator:
                 error="No criteria defined in this rule.",
             )
 
-        # Use the first criterion for simulation
         criterion = criteria[0]
         metric_field = criterion.get("metric", "")
         agg_type = criterion.get("aggType", "avg")
-        # "custom" metric means use aggField, otherwise metric IS the field
         if metric_field == "custom":
             agg_field = criterion.get("customMetrics", [{}])[0].get("field", "")
             agg_type = criterion.get("customMetrics", [{}])[0].get("aggType", "avg")
         else:
             agg_field = metric_field
 
-        # Build filter query — use override if provided, else rule's filterQueryText
         if filter_override is not None:
             base_query = self._build_filter_query(filter_override)
         elif filter_query_text:
@@ -288,12 +286,11 @@ class RuleSimulator:
     def _simulate_logs_document_count(
         self, rule: Rule, host_name: str | None, time_range_seconds: int,
         overrides: SimulationOverrides | None = None,
+        indices_override: list[str] | None = None,
     ) -> SimulationResult:
-        """Simulate logs.alert.document.count rules.
-
-        These count log documents matching criteria and compare against threshold.
-        """
-        comparator, thresholds, filter_override, indices = self._resolve_overrides(rule, overrides)
+        """Simulate logs.alert.document.count rules."""
+        comparator, thresholds, filter_override = self._resolve_overrides(rule, overrides)
+        indices = indices_override or rule.indices
         criteria = rule.criteria
 
         if not indices:
@@ -303,7 +300,6 @@ class RuleSimulator:
                 error="No indices found for log document count rule.",
             )
 
-        # Build a bool query from criteria (each criterion is a filter)
         must_clauses = []
         for c in criteria:
             field = c.get("field", "")
@@ -338,9 +334,11 @@ class RuleSimulator:
     def _simulate_generic(
         self, rule: Rule, host_name: str | None, time_range_seconds: int,
         overrides: SimulationOverrides | None = None,
+        indices_override: list[str] | None = None,
     ) -> SimulationResult:
         """Fallback simulation for unsupported rule types — tries count-based."""
-        comparator, thresholds, filter_override, indices = self._resolve_overrides(rule, overrides)
+        comparator, thresholds, filter_override = self._resolve_overrides(rule, overrides)
+        indices = indices_override or rule.indices
 
         base_query = self._build_filter_query(filter_override) if filter_override else {}
 

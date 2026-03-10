@@ -150,4 +150,3 @@ class SimulationOverrides:
     threshold: list[float] | None = None
     comparator: str | None = None
     filter_query: str | None = None  # KQL / query_string override
-    indices: list[str] | None = None  # Override indices/data views

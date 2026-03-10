@@ -45,7 +45,6 @@ class MainWindow(QMainWindow):
         self.rules: list[Rule] = []
         self.filtered_rules: list[Rule] = []
         self._worker: WorkerThread | None = None
-        self._indices_worker: WorkerThread | None = None
 
         self.setWindowTitle("Kibana Alert Simulator")
         self.setMinimumSize(1100, 700)
@@ -87,10 +86,18 @@ class MainWindow(QMainWindow):
         # ── Main content: splitter with rule list + detail panel ──
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # Left panel: Rule list
+        # Left panel: Rule list + Data source
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Data source picker
+        ds_group = QGroupBox("Data Source")
+        ds_layout = QVBoxLayout(ds_group)
+        self.indices_picker = IndicesPickerWidget()
+        self.indices_picker.selectionChanged.connect(self._on_indices_selection_changed)
+        ds_layout.addWidget(self.indices_picker)
+        left_layout.addWidget(ds_group)
 
         rules_group = QGroupBox("Alerting Rules")
         rules_layout = QVBoxLayout(rules_group)
@@ -155,9 +162,6 @@ class MainWindow(QMainWindow):
         self.override_filter.setPlaceholderText("KQL filter override (blank = rule default)")
         override_layout.addRow("Filter (KQL):", self.override_filter)
 
-        self.override_indices = IndicesPickerWidget()
-        override_layout.addRow("Indices Override:", self.override_indices)
-
         self.override_reset_btn = QPushButton("Reset Overrides")
         self.override_reset_btn.clicked.connect(self._reset_overrides)
         override_layout.addRow(self.override_reset_btn)
@@ -219,6 +223,7 @@ class MainWindow(QMainWindow):
         self.simulate_btn.setEnabled(connected and self.rule_list.currentRow() >= 0)
         self.simulate_all_btn.setEnabled(connected and len(self.filtered_rules) > 0)
         self.device_picker.setEnabled(connected)
+        self.indices_picker.setEnabled(connected)
 
         if connected:
             self.connection_label.setText(
@@ -274,7 +279,7 @@ class MainWindow(QMainWindow):
             )
         self.space_combo.blockSignals(False)
 
-        # Load available indices for the override picker
+        # Load available indices/data views for the data source picker
         self._load_available_indices()
 
         if self.space_combo.count() > 0:
@@ -284,20 +289,52 @@ class MainWindow(QMainWindow):
         if index >= 0:
             self._load_rules()
 
-    # ── Indices ─────────────────────────────────────────────────
+    # ── Data Source (Indices) ───────────────────────────────────
 
     def _load_available_indices(self):
-        """Fetch all indices/data streams for the override picker."""
+        """Fetch all indices/data streams for the data source picker."""
         def fetch():
             return self.client.get_indices()
 
-        self._indices_worker = WorkerThread(fetch)
-        self._indices_worker.finished.connect(self._on_indices_loaded)
-        self._indices_worker.error.connect(lambda msg: None)  # silent fail
-        self._indices_worker.start()
+        self._worker = WorkerThread(fetch)
+        self._worker.finished.connect(self._on_available_indices_loaded)
+        self._worker.error.connect(lambda msg: None)  # silent fail
+        self._worker.start()
 
-    def _on_indices_loaded(self, indices):
-        self.override_indices.set_indices(indices)
+    def _on_available_indices_loaded(self, indices):
+        self.indices_picker.set_indices(indices)
+
+    def _on_indices_selection_changed(self):
+        """When the user changes the data source selection, reload devices."""
+        selected = self.indices_picker.selected_indices()
+        if not selected:
+            # No selection — devices will load from the rule's indices when a rule is selected
+            rule = self._get_selected_rule()
+            if rule:
+                self._load_devices_for_rule(rule)
+            else:
+                self.device_picker.set_hosts([])
+            return
+
+        # Load hosts from the selected indices
+        time_seconds = self.time_range.get_seconds()
+        if time_seconds == 0:
+            time_seconds = 86400  # default 24h for data source browsing
+
+        self._show_busy(True, "Loading devices from selected indices...")
+
+        def fetch():
+            return self.client.get_hosts(selected, time_seconds)
+
+        self._worker = WorkerThread(fetch)
+        self._worker.finished.connect(self._on_devices_loaded)
+        self._worker.error.connect(self._on_error)
+        self._worker.start()
+
+    def _get_active_indices(self) -> list[str] | None:
+        """Return selected indices from the data source picker, or None to use rule defaults."""
+        selected = self.indices_picker.selected_indices()
+        return selected if selected else None
 
     # ── Rules ───────────────────────────────────────────────────
 
@@ -378,7 +415,9 @@ class MainWindow(QMainWindow):
     # ── Devices ─────────────────────────────────────────────────
 
     def _load_devices_for_rule(self, rule: Rule):
-        indices = rule.indices
+        # Use global data source if selected, otherwise fall back to rule's indices
+        global_indices = self._get_active_indices()
+        indices = global_indices or rule.indices
         if not indices:
             return
 
@@ -413,14 +452,12 @@ class MainWindow(QMainWindow):
         self.override_comparator.setCurrentIndex(0)
         self.override_threshold.clear()
         self.override_filter.clear()
-        self.override_indices.clear_selection()
 
     def _get_overrides(self) -> SimulationOverrides | None:
         """Build SimulationOverrides from the UI fields, or None if nothing is set."""
         comparator = None
         threshold = None
         filter_query = None
-        indices = None
 
         if self.override_comparator.currentIndex() > 0:
             comparator = self.override_comparator.currentText()
@@ -437,18 +474,13 @@ class MainWindow(QMainWindow):
         if filter_text:
             filter_query = filter_text
 
-        selected_indices = self.override_indices.selected_indices()
-        if selected_indices:
-            indices = selected_indices
-
-        if comparator is None and threshold is None and filter_query is None and indices is None:
+        if comparator is None and threshold is None and filter_query is None:
             return None
 
         return SimulationOverrides(
             threshold=threshold,
             comparator=comparator,
             filter_query=filter_query,
-            indices=indices,
         )
 
     # ── Simulation ──────────────────────────────────────────────
@@ -466,6 +498,7 @@ class MainWindow(QMainWindow):
             return
 
         selected_hosts = self.device_picker.selected_hosts()
+        indices_override = self._get_active_indices()
 
         time_seconds = self.time_range.get_seconds()
         if time_seconds == 0:
@@ -479,18 +512,16 @@ class MainWindow(QMainWindow):
 
         def run():
             if not selected_hosts:
-                # No selection = all devices
-                return self.simulator.simulate(rule, None, time_seconds, overrides)
+                return self.simulator.simulate(rule, None, time_seconds, overrides, indices_override)
             elif len(selected_hosts) == 1:
-                return self.simulator.simulate(rule, selected_hosts[0], time_seconds, overrides)
+                return self.simulator.simulate(rule, selected_hosts[0], time_seconds, overrides, indices_override)
             else:
-                # Multi-host: simulate each and combine
                 all_device_results = []
                 any_fired = False
                 total = 0.0
                 last_result = None
                 for host in selected_hosts:
-                    r = self.simulator.simulate(rule, host, time_seconds, overrides)
+                    r = self.simulator.simulate(rule, host, time_seconds, overrides, indices_override)
                     all_device_results.extend(r.device_results)
                     if r.fired:
                         any_fired = True
@@ -517,6 +548,7 @@ class MainWindow(QMainWindow):
             return
 
         selected_hosts = self.device_picker.selected_hosts()
+        indices_override = self._get_active_indices()
 
         time_seconds = self.time_range.get_seconds()
         if time_seconds == 0:
@@ -534,17 +566,16 @@ class MainWindow(QMainWindow):
             for rule in rules_to_sim:
                 try:
                     if not selected_hosts:
-                        result = self.simulator.simulate(rule, None, time_seconds, overrides)
+                        result = self.simulator.simulate(rule, None, time_seconds, overrides, indices_override)
                     elif len(selected_hosts) == 1:
-                        result = self.simulator.simulate(rule, selected_hosts[0], time_seconds, overrides)
+                        result = self.simulator.simulate(rule, selected_hosts[0], time_seconds, overrides, indices_override)
                     else:
-                        # Multi-host: simulate each and combine
                         all_dr = []
                         any_fired = False
                         total = 0.0
                         last = None
                         for host in selected_hosts:
-                            r = self.simulator.simulate(rule, host, time_seconds, overrides)
+                            r = self.simulator.simulate(rule, host, time_seconds, overrides, indices_override)
                             all_dr.extend(r.device_results)
                             if r.fired:
                                 any_fired = True
