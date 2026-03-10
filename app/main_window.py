@@ -12,7 +12,10 @@ from .client import ElasticKibanaClient
 from .simulator import RuleSimulator
 from .models import Rule, SimulationResult, SimulationOverrides, ConnectionConfig
 from .connection_dialog import ConnectionDialog
-from .widgets import TimeRangeWidget, RuleDetailWidget, SimulationResultWidget
+from .widgets import (
+    TimeRangeWidget, RuleDetailWidget, SimulationResultWidget,
+    DevicePickerWidget, IndicesPickerWidget,
+)
 
 
 class WorkerThread(QThread):
@@ -42,6 +45,7 @@ class MainWindow(QMainWindow):
         self.rules: list[Rule] = []
         self.filtered_rules: list[Rule] = []
         self._worker: WorkerThread | None = None
+        self._indices_worker: WorkerThread | None = None
 
         self.setWindowTitle("Kibana Alert Simulator")
         self.setMinimumSize(1100, 700)
@@ -119,11 +123,8 @@ class MainWindow(QMainWindow):
         sim_group = QGroupBox("Simulation")
         sim_layout = QFormLayout(sim_group)
 
-        self.device_combo = QComboBox()
-        self.device_combo.addItem("All Devices")
-        self.device_combo.setEditable(True)
-        self.device_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        sim_layout.addRow("Device (host.name):", self.device_combo)
+        self.device_picker = DevicePickerWidget()
+        sim_layout.addRow("Device (host.name):", self.device_picker)
 
         self.time_range = TimeRangeWidget()
         sim_layout.addRow("Time Range:", self.time_range)
@@ -153,6 +154,9 @@ class MainWindow(QMainWindow):
         self.override_filter = QLineEdit()
         self.override_filter.setPlaceholderText("KQL filter override (blank = rule default)")
         override_layout.addRow("Filter (KQL):", self.override_filter)
+
+        self.override_indices = IndicesPickerWidget()
+        override_layout.addRow("Indices Override:", self.override_indices)
 
         self.override_reset_btn = QPushButton("Reset Overrides")
         self.override_reset_btn.clicked.connect(self._reset_overrides)
@@ -214,7 +218,7 @@ class MainWindow(QMainWindow):
         self.rule_filter.setEnabled(connected)
         self.simulate_btn.setEnabled(connected and self.rule_list.currentRow() >= 0)
         self.simulate_all_btn.setEnabled(connected and len(self.filtered_rules) > 0)
-        self.device_combo.setEnabled(connected)
+        self.device_picker.setEnabled(connected)
 
         if connected:
             self.connection_label.setText(
@@ -270,12 +274,30 @@ class MainWindow(QMainWindow):
             )
         self.space_combo.blockSignals(False)
 
+        # Load available indices for the override picker
+        self._load_available_indices()
+
         if self.space_combo.count() > 0:
             self._on_space_changed(0)
 
     def _on_space_changed(self, index):
         if index >= 0:
             self._load_rules()
+
+    # ── Indices ─────────────────────────────────────────────────
+
+    def _load_available_indices(self):
+        """Fetch all indices/data streams for the override picker."""
+        def fetch():
+            return self.client.get_indices()
+
+        self._indices_worker = WorkerThread(fetch)
+        self._indices_worker.finished.connect(self._on_indices_loaded)
+        self._indices_worker.error.connect(lambda msg: None)  # silent fail
+        self._indices_worker.start()
+
+    def _on_indices_loaded(self, indices):
+        self.override_indices.set_indices(indices)
 
     # ── Rules ───────────────────────────────────────────────────
 
@@ -312,10 +334,14 @@ class MainWindow(QMainWindow):
         self.rule_list.blockSignals(True)
         self.rule_list.clear()
         for rule in self.filtered_rules:
-            status = "ON" if rule.enabled else "OFF"
-            item = QListWidgetItem(f"[{status}] {rule.name} ({rule.display_type})")
-            if not rule.enabled:
-                item.setForeground(QColor("#888"))
+            if rule.enabled:
+                status_text = "ENABLED"
+                item = QListWidgetItem(f"[{status_text}] {rule.name} ({rule.display_type})")
+                item.setForeground(QColor("#27ae60"))
+            else:
+                status_text = "DISABLED"
+                item = QListWidgetItem(f"[{status_text}] {rule.name} ({rule.display_type})")
+                item.setForeground(QColor("#e74c3c"))
             self.rule_list.addItem(item)
         self.rule_list.blockSignals(False)
 
@@ -372,19 +398,7 @@ class MainWindow(QMainWindow):
 
     def _on_devices_loaded(self, hosts):
         self._show_busy(False)
-        current_text = self.device_combo.currentText()
-        self.device_combo.blockSignals(True)
-        self.device_combo.clear()
-        self.device_combo.addItem("All Devices")
-        for host in hosts:
-            self.device_combo.addItem(host)
-        self.device_combo.blockSignals(False)
-
-        # Restore selection if it still exists
-        idx = self.device_combo.findText(current_text)
-        if idx >= 0:
-            self.device_combo.setCurrentIndex(idx)
-
+        self.device_picker.set_hosts(hosts)
         self.statusbar.showMessage(f"{len(hosts)} devices found", 3000)
 
     # ── What-If Overrides ───────────────────────────────────────
@@ -399,12 +413,14 @@ class MainWindow(QMainWindow):
         self.override_comparator.setCurrentIndex(0)
         self.override_threshold.clear()
         self.override_filter.clear()
+        self.override_indices.clear_selection()
 
     def _get_overrides(self) -> SimulationOverrides | None:
         """Build SimulationOverrides from the UI fields, or None if nothing is set."""
         comparator = None
         threshold = None
         filter_query = None
+        indices = None
 
         if self.override_comparator.currentIndex() > 0:
             comparator = self.override_comparator.currentText()
@@ -421,13 +437,18 @@ class MainWindow(QMainWindow):
         if filter_text:
             filter_query = filter_text
 
-        if comparator is None and threshold is None and filter_query is None:
+        selected_indices = self.override_indices.selected_indices()
+        if selected_indices:
+            indices = selected_indices
+
+        if comparator is None and threshold is None and filter_query is None and indices is None:
             return None
 
         return SimulationOverrides(
             threshold=threshold,
             comparator=comparator,
             filter_query=filter_query,
+            indices=indices,
         )
 
     # ── Simulation ──────────────────────────────────────────────
@@ -444,11 +465,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No Rule", "Please select a rule first.")
             return
 
-        host_name = None
-        if self.device_combo.currentIndex() > 0:
-            host_name = self.device_combo.currentText()
-        elif self.device_combo.currentText() and self.device_combo.currentText() != "All Devices":
-            host_name = self.device_combo.currentText()
+        selected_hosts = self.device_picker.selected_hosts()
 
         time_seconds = self.time_range.get_seconds()
         if time_seconds == 0:
@@ -461,7 +478,34 @@ class MainWindow(QMainWindow):
         overrides = self._get_overrides()
 
         def run():
-            return self.simulator.simulate(rule, host_name, time_seconds, overrides)
+            if not selected_hosts:
+                # No selection = all devices
+                return self.simulator.simulate(rule, None, time_seconds, overrides)
+            elif len(selected_hosts) == 1:
+                return self.simulator.simulate(rule, selected_hosts[0], time_seconds, overrides)
+            else:
+                # Multi-host: simulate each and combine
+                all_device_results = []
+                any_fired = False
+                total = 0.0
+                last_result = None
+                for host in selected_hosts:
+                    r = self.simulator.simulate(rule, host, time_seconds, overrides)
+                    all_device_results.extend(r.device_results)
+                    if r.fired:
+                        any_fired = True
+                    total += r.total_match_count
+                    last_result = r
+                all_device_results.sort(key=lambda d: (-int(d.fired), -d.match_count))
+                return SimulationResult(
+                    rule=rule, fired=any_fired, total_match_count=total,
+                    threshold=last_result.threshold, comparator=last_result.comparator,
+                    device_results=all_device_results,
+                    time_range_start=last_result.time_range_start,
+                    time_range_end=last_result.time_range_end,
+                    query_used=last_result.query_used,
+                    has_overrides=last_result.has_overrides,
+                )
 
         self._worker = WorkerThread(run)
         self._worker.finished.connect(self._on_simulation_done)
@@ -472,11 +516,7 @@ class MainWindow(QMainWindow):
         if not self.filtered_rules:
             return
 
-        host_name = None
-        if self.device_combo.currentIndex() > 0:
-            host_name = self.device_combo.currentText()
-        elif self.device_combo.currentText() and self.device_combo.currentText() != "All Devices":
-            host_name = self.device_combo.currentText()
+        selected_hosts = self.device_picker.selected_hosts()
 
         time_seconds = self.time_range.get_seconds()
         if time_seconds == 0:
@@ -493,11 +533,37 @@ class MainWindow(QMainWindow):
             results = []
             for rule in rules_to_sim:
                 try:
-                    result = self.simulator.simulate(rule, host_name, time_seconds, overrides)
+                    if not selected_hosts:
+                        result = self.simulator.simulate(rule, None, time_seconds, overrides)
+                    elif len(selected_hosts) == 1:
+                        result = self.simulator.simulate(rule, selected_hosts[0], time_seconds, overrides)
+                    else:
+                        # Multi-host: simulate each and combine
+                        all_dr = []
+                        any_fired = False
+                        total = 0.0
+                        last = None
+                        for host in selected_hosts:
+                            r = self.simulator.simulate(rule, host, time_seconds, overrides)
+                            all_dr.extend(r.device_results)
+                            if r.fired:
+                                any_fired = True
+                            total += r.total_match_count
+                            last = r
+                        all_dr.sort(key=lambda d: (-int(d.fired), -d.match_count))
+                        result = SimulationResult(
+                            rule=rule, fired=any_fired, total_match_count=total,
+                            threshold=last.threshold, comparator=last.comparator,
+                            device_results=all_dr,
+                            time_range_start=last.time_range_start,
+                            time_range_end=last.time_range_end,
+                            query_used=last.query_used,
+                            has_overrides=last.has_overrides,
+                        )
                     results.append(result)
                 except Exception as e:
-                    from .models import SimulationResult
-                    results.append(SimulationResult(
+                    from .models import SimulationResult as SR
+                    results.append(SR(
                         rule=rule, fired=False, total_match_count=0,
                         threshold=[0], comparator=">", error=str(e),
                     ))
@@ -530,20 +596,22 @@ class MainWindow(QMainWindow):
         fired_count = sum(1 for r in results if r.fired)
         total = len(results)
 
-        # Create device results from rule results for display
+        # Create paired list of (DeviceResult, SimulationResult) for sorting
         from .models import DeviceResult
-        device_results = []
+        paired = []
         for r in results:
-            comparator, thresholds = r.comparator, r.threshold
-            threshold_str = str(thresholds[0]) if thresholds else "0"
-            device_results.append(DeviceResult(
+            dr = DeviceResult(
                 host_name=f"{r.rule.name} ({r.rule.display_type})",
                 match_count=r.total_match_count,
                 fired=r.fired,
-            ))
+            )
+            paired.append((dr, r))
 
-        # Sort: fired first
-        device_results.sort(key=lambda d: (-int(d.fired), -d.match_count))
+        # Sort: fired first, then by match count descending
+        paired.sort(key=lambda p: (-int(p[0].fired), -p[0].match_count))
+
+        device_results = [p[0] for p in paired]
+        sorted_results = [p[1] for p in paired]
 
         # Create a summary result
         summary = SimulationResult(
@@ -558,11 +626,13 @@ class MainWindow(QMainWindow):
         )
 
         self.result_widget.set_result(summary)
+        self.result_widget.set_all_rules_results(sorted_results)
         self.result_widget.summary_label.setText(
             f"<b>All Rules Simulation:</b> "
             f"<span style='color: #e74c3c;'>{fired_count} WOULD FIRE</span> / "
             f"<span style='color: #27ae60;'>{total - fired_count} OK</span> "
-            f"out of {total} rules"
+            f"out of {total} rules &nbsp; "
+            f"<small>(double-click a row for details)</small>"
         )
 
         self.statusbar.showMessage(

@@ -20,9 +20,10 @@ class RuleSimulator:
         self.client = client
 
     def _resolve_overrides(self, rule: Rule, overrides: SimulationOverrides | None):
-        """Return (comparator, thresholds, filter_query) with overrides applied."""
+        """Return (comparator, thresholds, filter_query, indices) with overrides applied."""
         comparator, thresholds = rule.threshold_info
         filter_query = None
+        indices = rule.indices
 
         if overrides:
             if overrides.comparator is not None:
@@ -31,8 +32,10 @@ class RuleSimulator:
                 thresholds = overrides.threshold
             if overrides.filter_query is not None:
                 filter_query = overrides.filter_query
+            if overrides.indices is not None:
+                indices = overrides.indices
 
-        return comparator, thresholds, filter_query
+        return comparator, thresholds, filter_query, indices
 
     def _build_filter_query(self, filter_text: str) -> dict:
         """Convert a KQL/query_string filter into an ES query clause."""
@@ -88,8 +91,7 @@ class RuleSimulator:
         overrides: SimulationOverrides | None = None,
     ) -> SimulationResult:
         params = rule.params
-        indices = rule.indices
-        comparator, thresholds, filter_override = self._resolve_overrides(rule, overrides)
+        comparator, thresholds, filter_override, indices = self._resolve_overrides(rule, overrides)
 
         # Extract the ES query from the rule
         es_query = {}
@@ -139,8 +141,7 @@ class RuleSimulator:
         overrides: SimulationOverrides | None = None,
     ) -> SimulationResult:
         params = rule.params
-        indices = rule.indices
-        comparator, thresholds, filter_override = self._resolve_overrides(rule, overrides)
+        comparator, thresholds, filter_override, indices = self._resolve_overrides(rule, overrides)
         agg_type = params.get("aggType", "count")
         agg_field = params.get("aggField")
         term_field = params.get("termField")
@@ -207,9 +208,8 @@ class RuleSimulator:
           "threshold": [0.9], "aggType": "avg", "timeSize": 5, "timeUnit": "m"}]
         """
         params = rule.params
-        indices = rule.indices
+        comparator, thresholds, filter_override, indices = self._resolve_overrides(rule, overrides)
         criteria = rule.criteria
-        comparator, thresholds, filter_override = self._resolve_overrides(rule, overrides)
         filter_query_text = params.get("filterQueryText", "")
 
         if not indices:
@@ -293,8 +293,7 @@ class RuleSimulator:
 
         These count log documents matching criteria and compare against threshold.
         """
-        indices = rule.indices
-        comparator, thresholds, filter_override = self._resolve_overrides(rule, overrides)
+        comparator, thresholds, filter_override, indices = self._resolve_overrides(rule, overrides)
         criteria = rule.criteria
 
         if not indices:
@@ -341,8 +340,7 @@ class RuleSimulator:
         overrides: SimulationOverrides | None = None,
     ) -> SimulationResult:
         """Fallback simulation for unsupported rule types — tries count-based."""
-        indices = rule.indices
-        comparator, thresholds, filter_override = self._resolve_overrides(rule, overrides)
+        comparator, thresholds, filter_override, indices = self._resolve_overrides(rule, overrides)
 
         base_query = self._build_filter_query(filter_override) if filter_override else {}
 

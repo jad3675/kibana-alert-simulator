@@ -2,7 +2,8 @@ import json
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QComboBox, QLabel,
     QSpinBox, QGroupBox, QTreeWidget, QTreeWidgetItem,
-    QTextEdit, QHeaderView, QSplitter,
+    QTextEdit, QHeaderView, QSplitter, QDialog, QPushButton,
+    QLineEdit, QListWidget, QListWidgetItem, QAbstractItemView,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont
@@ -71,6 +72,141 @@ class TimeRangeWidget(QWidget):
             multipliers = {"minutes": 60, "hours": 3600, "days": 86400}
             return v * multipliers.get(unit, 60)
         return value
+
+
+class DevicePickerWidget(QWidget):
+    """Searchable, multi-select device (host.name) picker."""
+
+    selectionChanged = pyqtSignal()  # emitted when selection changes
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search devices... (empty = all)")
+        self.search_input.textChanged.connect(self._apply_filter)
+        layout.addWidget(self.search_input)
+
+        self.list_widget = QListWidget()
+        self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        self.list_widget.setMaximumHeight(120)
+        self.list_widget.itemSelectionChanged.connect(self.selectionChanged.emit)
+        layout.addWidget(self.list_widget)
+
+        self.status_label = QLabel("0 devices")
+        self.status_label.setStyleSheet("color: #888; font-size: 11px;")
+        layout.addWidget(self.status_label)
+
+        self._all_hosts: list[str] = []
+
+    def set_hosts(self, hosts: list[str]):
+        """Replace the full host list and reset selection."""
+        self._all_hosts = sorted(hosts)
+        self._apply_filter()
+        self.status_label.setText(f"{len(hosts)} devices")
+
+    def _apply_filter(self):
+        text = self.search_input.text().lower()
+        self.list_widget.blockSignals(True)
+        self.list_widget.clear()
+        for host in self._all_hosts:
+            if not text or text in host.lower():
+                self.list_widget.addItem(host)
+        self.list_widget.blockSignals(False)
+
+    def selected_hosts(self) -> list[str]:
+        """Return list of selected host names. Empty list means 'all devices'."""
+        return [item.text() for item in self.list_widget.selectedItems()]
+
+    def clear_selection(self):
+        self.list_widget.clearSelection()
+        self.search_input.clear()
+
+    def setEnabled(self, enabled: bool):
+        super().setEnabled(enabled)
+        self.search_input.setEnabled(enabled)
+        self.list_widget.setEnabled(enabled)
+
+
+class IndicesPickerWidget(QWidget):
+    """Searchable, multi-select indices/data view picker with select-all support."""
+
+    selectionChanged = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search indices / data views...")
+        self.search_input.textChanged.connect(self._apply_filter)
+        layout.addWidget(self.search_input)
+
+        self.list_widget = QListWidget()
+        self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        self.list_widget.setMaximumHeight(150)
+        self.list_widget.itemSelectionChanged.connect(self.selectionChanged.emit)
+        layout.addWidget(self.list_widget)
+
+        btn_row = QHBoxLayout()
+        self.select_all_btn = QPushButton("Select All Visible")
+        self.select_all_btn.clicked.connect(self._select_all_visible)
+        btn_row.addWidget(self.select_all_btn)
+        self.clear_btn = QPushButton("Clear")
+        self.clear_btn.clicked.connect(self.clear_selection)
+        btn_row.addWidget(self.clear_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        self.status_label = QLabel("0 indices")
+        self.status_label.setStyleSheet("color: #888; font-size: 11px;")
+        layout.addWidget(self.status_label)
+
+        self._all_indices: list[str] = []
+
+    def set_indices(self, indices: list[str]):
+        self._all_indices = sorted(indices)
+        self._apply_filter()
+        self.status_label.setText(
+            f"{len(indices)} indices/data views available"
+        )
+
+    def _apply_filter(self):
+        text = self.search_input.text().lower()
+        # Remember current selection
+        previously_selected = {item.text() for item in self.list_widget.selectedItems()}
+        self.list_widget.blockSignals(True)
+        self.list_widget.clear()
+        for idx in self._all_indices:
+            if not text or text in idx.lower():
+                item = QListWidgetItem(idx)
+                self.list_widget.addItem(item)
+                if idx in previously_selected:
+                    item.setSelected(True)
+        self.list_widget.blockSignals(False)
+
+    def _select_all_visible(self):
+        for i in range(self.list_widget.count()):
+            self.list_widget.item(i).setSelected(True)
+
+    def selected_indices(self) -> list[str]:
+        return [item.text() for item in self.list_widget.selectedItems()]
+
+    def clear_selection(self):
+        self.list_widget.clearSelection()
+        self.search_input.clear()
+
+    def setEnabled(self, enabled: bool):
+        super().setEnabled(enabled)
+        self.search_input.setEnabled(enabled)
+        self.list_widget.setEnabled(enabled)
+        self.select_all_btn.setEnabled(enabled)
+        self.clear_btn.setEnabled(enabled)
 
 
 class RuleDetailWidget(QWidget):
@@ -265,8 +401,13 @@ class SimulationResultWidget(QWidget):
         self.query_text.setVisible(False)
         layout.addWidget(self.query_text)
 
+        # Per-rule results for all-rules mode (keyed by row index)
+        self._per_rule_results: dict[int, SimulationResult] = {}
+        self.result_tree.itemDoubleClicked.connect(self._on_item_double_clicked)
+
     def set_result(self, result: SimulationResult):
         self.result_tree.clear()
+        self._per_rule_results.clear()
 
         comparator, thresholds = result.comparator, result.threshold
         threshold_str = (
@@ -328,7 +469,119 @@ class SimulationResultWidget(QWidget):
         else:
             self.query_text.setVisible(False)
 
+    def set_all_rules_results(self, results: list[SimulationResult]):
+        """Store individual rule results so double-click can show detail."""
+        self._per_rule_results.clear()
+        for i, r in enumerate(results):
+            self._per_rule_results[i] = r
+
+    def _on_item_double_clicked(self, item: QTreeWidgetItem, column: int):
+        row = self.result_tree.indexOfTopLevelItem(item)
+        if row in self._per_rule_results:
+            result = self._per_rule_results[row]
+            dialog = RuleResultDialog(result, self)
+            dialog.exec()
+
     def clear_results(self):
         self.result_tree.clear()
+        self._per_rule_results.clear()
         self.summary_label.setText("Run a simulation to see results.")
         self.query_text.setVisible(False)
+
+
+class RuleResultDialog(QDialog):
+    """Popup showing per-device breakdown for a single rule from the all-rules simulation."""
+
+    def __init__(self, result: SimulationResult, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Rule Detail: {result.rule.name}")
+        self.setMinimumSize(600, 400)
+        self.resize(700, 450)
+
+        layout = QVBoxLayout(self)
+
+        # Rule info header
+        comparator, thresholds = result.comparator, result.threshold
+        threshold_str = (
+            f"{thresholds[0]} and {thresholds[1]}"
+            if len(thresholds) > 1
+            else str(thresholds[0]) if thresholds else "N/A"
+        )
+
+        header = QLabel(
+            f"<b>{result.rule.name}</b> ({result.rule.display_type})<br>"
+            f"Threshold: {comparator} {threshold_str} &nbsp;|&nbsp; "
+            f"Indices: {', '.join(result.rule.indices) if result.rule.indices else 'N/A'}"
+        )
+        header.setWordWrap(True)
+        layout.addWidget(header)
+
+        # Status
+        if result.fired:
+            fired_count = sum(1 for d in result.device_results if d.fired)
+            total_count = len(result.device_results)
+            status = QLabel(
+                f"<b style='color: #e74c3c;'>WOULD FIRE</b> — "
+                f"{fired_count} of {total_count} device(s) breached threshold"
+            )
+        else:
+            status = QLabel(
+                f"<b style='color: #27ae60;'>WOULD NOT FIRE</b> — "
+                f"No devices breached threshold"
+            )
+        status.setWordWrap(True)
+        layout.addWidget(status)
+
+        if result.error:
+            err = QLabel(f"<span style='color: orange;'>Note: {result.error}</span>")
+            err.setWordWrap(True)
+            layout.addWidget(err)
+
+        # Device table
+        tree = QTreeWidget()
+        tree.setHeaderLabels(["Device", "Value", "Threshold", "Status"])
+        tree.setAlternatingRowColors(True)
+        tree.setRootIsDecorated(False)
+        h = tree.header()
+        h.setStretchLastSection(True)
+        h.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        h.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        h.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        h.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+
+        for dr in result.device_results:
+            val_str = (
+                f"{dr.match_count:,.0f}"
+                if dr.match_count == int(dr.match_count)
+                else f"{dr.match_count:,.4f}"
+            )
+            item = QTreeWidgetItem([
+                dr.host_name,
+                val_str,
+                f"{comparator} {threshold_str}",
+                "BREACHED" if dr.fired else "OK",
+            ])
+            if dr.fired:
+                for col in range(4):
+                    item.setForeground(col, QColor("#e74c3c"))
+                item.setFont(3, QFont("", -1, QFont.Weight.Bold))
+            else:
+                item.setForeground(3, QColor("#27ae60"))
+            tree.addTopLevelItem(item)
+
+        layout.addWidget(tree)
+
+        # Query used
+        if result.query_used:
+            query_label = QLabel("<b>Query used:</b>")
+            layout.addWidget(query_label)
+            query_text = QTextEdit()
+            query_text.setReadOnly(True)
+            query_text.setMaximumHeight(100)
+            query_text.setPlainText(json.dumps(result.query_used, indent=2))
+            layout.addWidget(query_text)
+
+        # Close button
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        layout.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignRight)
