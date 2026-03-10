@@ -1,5 +1,5 @@
 import json
-from .models import Rule, SimulationResult, DeviceResult
+from .models import Rule, SimulationResult, SimulationOverrides, DeviceResult
 from .client import ElasticKibanaClient
 
 
@@ -19,14 +19,49 @@ class RuleSimulator:
     def __init__(self, client: ElasticKibanaClient):
         self.client = client
 
+    def _resolve_overrides(self, rule: Rule, overrides: SimulationOverrides | None):
+        """Return (comparator, thresholds, filter_query) with overrides applied."""
+        comparator, thresholds = rule.threshold_info
+        filter_query = None
+
+        if overrides:
+            if overrides.comparator is not None:
+                comparator = overrides.comparator
+            if overrides.threshold is not None:
+                thresholds = overrides.threshold
+            if overrides.filter_query is not None:
+                filter_query = overrides.filter_query
+
+        return comparator, thresholds, filter_query
+
+    def _build_filter_query(self, filter_text: str) -> dict:
+        """Convert a KQL/query_string filter into an ES query clause."""
+        if filter_text.strip():
+            return {"query_string": {"query": filter_text}}
+        return {}
+
+    def _merge_filter(self, base_query: dict, filter_override: str | None) -> dict:
+        """If a filter override is set, combine it with the base query."""
+        if filter_override is None:
+            return base_query
+        override_clause = self._build_filter_query(filter_override)
+        if not override_clause:
+            return base_query
+        if not base_query:
+            return override_clause
+        # Combine both with bool/must
+        return {"bool": {"must": [base_query, override_clause]}}
+
     def simulate(
         self,
         rule: Rule,
         host_name: str | None = None,
         time_range_seconds: int | None = None,
+        overrides: SimulationOverrides | None = None,
     ) -> SimulationResult:
         """
         Simulate a rule. If host_name is None, simulates against all devices.
+        Overrides allow what-if testing without modifying the real rule.
         """
         if time_range_seconds is None:
             time_range_seconds = rule.time_window_seconds or rule.interval_seconds
@@ -34,22 +69,27 @@ class RuleSimulator:
         rule_type = rule.rule_type
 
         if rule_type == ".es-query":
-            return self._simulate_es_query(rule, host_name, time_range_seconds)
+            result = self._simulate_es_query(rule, host_name, time_range_seconds, overrides)
         elif rule_type == ".index-threshold":
-            return self._simulate_index_threshold(rule, host_name, time_range_seconds)
+            result = self._simulate_index_threshold(rule, host_name, time_range_seconds, overrides)
         elif rule_type == "metrics.alert.threshold":
-            return self._simulate_metrics_threshold(rule, host_name, time_range_seconds)
+            result = self._simulate_metrics_threshold(rule, host_name, time_range_seconds, overrides)
         elif rule_type == "logs.alert.document.count":
-            return self._simulate_logs_document_count(rule, host_name, time_range_seconds)
+            result = self._simulate_logs_document_count(rule, host_name, time_range_seconds, overrides)
         else:
-            return self._simulate_generic(rule, host_name, time_range_seconds)
+            result = self._simulate_generic(rule, host_name, time_range_seconds, overrides)
+
+        if overrides is not None:
+            result.has_overrides = True
+        return result
 
     def _simulate_es_query(
-        self, rule: Rule, host_name: str | None, time_range_seconds: int
+        self, rule: Rule, host_name: str | None, time_range_seconds: int,
+        overrides: SimulationOverrides | None = None,
     ) -> SimulationResult:
         params = rule.params
         indices = rule.indices
-        comparator, thresholds = rule.threshold_info
+        comparator, thresholds, filter_override = self._resolve_overrides(rule, overrides)
 
         # Extract the ES query from the rule
         es_query = {}
@@ -74,6 +114,8 @@ class RuleSimulator:
                     search_source = {}
             es_query = search_source.get("query", {})
 
+        es_query = self._merge_filter(es_query, filter_override)
+
         if not indices:
             return SimulationResult(
                 rule=rule, fired=False, total_match_count=0,
@@ -93,16 +135,19 @@ class RuleSimulator:
             )
 
     def _simulate_index_threshold(
-        self, rule: Rule, host_name: str | None, time_range_seconds: int
+        self, rule: Rule, host_name: str | None, time_range_seconds: int,
+        overrides: SimulationOverrides | None = None,
     ) -> SimulationResult:
         params = rule.params
         indices = rule.indices
-        comparator, thresholds = rule.threshold_info
+        comparator, thresholds, filter_override = self._resolve_overrides(rule, overrides)
         agg_type = params.get("aggType", "count")
         agg_field = params.get("aggField")
         term_field = params.get("termField")
         term_size = params.get("termSize", 5)
         group_by = params.get("groupBy", "all")
+
+        base_query = self._build_filter_query(filter_override) if filter_override else {}
 
         if not indices:
             return SimulationResult(
@@ -115,7 +160,7 @@ class RuleSimulator:
             if host_name:
                 result = self.client.execute_agg_query(
                     indices=indices,
-                    query={},
+                    query=base_query,
                     agg_type=agg_type,
                     agg_field=agg_field,
                     time_range_seconds=time_range_seconds,
@@ -135,7 +180,7 @@ class RuleSimulator:
             else:
                 result = self.client.execute_agg_query(
                     indices=indices,
-                    query={},
+                    query=base_query,
                     agg_type=agg_type,
                     agg_field=agg_field,
                     time_range_seconds=time_range_seconds,
@@ -152,7 +197,8 @@ class RuleSimulator:
             )
 
     def _simulate_metrics_threshold(
-        self, rule: Rule, host_name: str | None, time_range_seconds: int
+        self, rule: Rule, host_name: str | None, time_range_seconds: int,
+        overrides: SimulationOverrides | None = None,
     ) -> SimulationResult:
         """Simulate metrics.alert.threshold rules.
 
@@ -163,7 +209,7 @@ class RuleSimulator:
         params = rule.params
         indices = rule.indices
         criteria = rule.criteria
-        comparator, thresholds = rule.threshold_info
+        comparator, thresholds, filter_override = self._resolve_overrides(rule, overrides)
         filter_query_text = params.get("filterQueryText", "")
 
         if not indices:
@@ -191,10 +237,13 @@ class RuleSimulator:
         else:
             agg_field = metric_field
 
-        # Build filter query from filterQueryText (KQL)
-        base_query = {}
-        if filter_query_text:
+        # Build filter query — use override if provided, else rule's filterQueryText
+        if filter_override is not None:
+            base_query = self._build_filter_query(filter_override)
+        elif filter_query_text:
             base_query = {"query_string": {"query": filter_query_text}}
+        else:
+            base_query = {}
 
         try:
             if host_name:
@@ -237,14 +286,15 @@ class RuleSimulator:
             )
 
     def _simulate_logs_document_count(
-        self, rule: Rule, host_name: str | None, time_range_seconds: int
+        self, rule: Rule, host_name: str | None, time_range_seconds: int,
+        overrides: SimulationOverrides | None = None,
     ) -> SimulationResult:
         """Simulate logs.alert.document.count rules.
 
         These count log documents matching criteria and compare against threshold.
         """
         indices = rule.indices
-        comparator, thresholds = rule.threshold_info
+        comparator, thresholds, filter_override = self._resolve_overrides(rule, overrides)
         criteria = rule.criteria
 
         if not indices:
@@ -273,6 +323,7 @@ class RuleSimulator:
                     must_clauses.append(clause)
 
         base_query = {"bool": {"must": must_clauses}} if must_clauses else {}
+        base_query = self._merge_filter(base_query, filter_override)
 
         if host_name:
             return self._simulate_single_host(
@@ -286,11 +337,14 @@ class RuleSimulator:
             )
 
     def _simulate_generic(
-        self, rule: Rule, host_name: str | None, time_range_seconds: int
+        self, rule: Rule, host_name: str | None, time_range_seconds: int,
+        overrides: SimulationOverrides | None = None,
     ) -> SimulationResult:
         """Fallback simulation for unsupported rule types — tries count-based."""
         indices = rule.indices
-        comparator, thresholds = rule.threshold_info
+        comparator, thresholds, filter_override = self._resolve_overrides(rule, overrides)
+
+        base_query = self._build_filter_query(filter_override) if filter_override else {}
 
         if not indices:
             return SimulationResult(
@@ -302,12 +356,12 @@ class RuleSimulator:
 
         if host_name:
             return self._simulate_single_host(
-                rule, indices, {}, comparator, thresholds,
+                rule, indices, base_query, comparator, thresholds,
                 host_name, time_range_seconds,
             )
         else:
             return self._simulate_all_hosts(
-                rule, indices, {}, comparator, thresholds,
+                rule, indices, base_query, comparator, thresholds,
                 time_range_seconds,
             )
 

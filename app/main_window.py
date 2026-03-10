@@ -10,7 +10,7 @@ from PyQt6.QtGui import QColor, QIcon
 
 from .client import ElasticKibanaClient
 from .simulator import RuleSimulator
-from .models import Rule, SimulationResult, ConnectionConfig
+from .models import Rule, SimulationResult, SimulationOverrides, ConnectionConfig
 from .connection_dialog import ConnectionDialog
 from .widgets import TimeRangeWidget, RuleDetailWidget, SimulationResultWidget
 
@@ -127,6 +127,39 @@ class MainWindow(QMainWindow):
 
         self.time_range = TimeRangeWidget()
         sim_layout.addRow("Time Range:", self.time_range)
+
+        # ── What-If Overrides ──
+        self.override_toggle = QPushButton("▶ What-If Overrides")
+        self.override_toggle.setCheckable(True)
+        self.override_toggle.setStyleSheet(
+            "QPushButton { text-align: left; border: none; font-weight: bold; "
+            "background: transparent; padding: 4px 0; }"
+        )
+        self.override_toggle.toggled.connect(self._toggle_overrides)
+        sim_layout.addRow(self.override_toggle)
+
+        self.override_container = QWidget()
+        override_layout = QFormLayout(self.override_container)
+        override_layout.setContentsMargins(10, 0, 0, 0)
+
+        self.override_comparator = QComboBox()
+        self.override_comparator.addItems(["(use rule default)", ">", ">=", "<", "<=", "between", "notBetween"])
+        override_layout.addRow("Comparator:", self.override_comparator)
+
+        self.override_threshold = QLineEdit()
+        self.override_threshold.setPlaceholderText("e.g. 100 or 50,200 for between (blank = rule default)")
+        override_layout.addRow("Threshold:", self.override_threshold)
+
+        self.override_filter = QLineEdit()
+        self.override_filter.setPlaceholderText("KQL filter override (blank = rule default)")
+        override_layout.addRow("Filter (KQL):", self.override_filter)
+
+        self.override_reset_btn = QPushButton("Reset Overrides")
+        self.override_reset_btn.clicked.connect(self._reset_overrides)
+        override_layout.addRow(self.override_reset_btn)
+
+        self.override_container.setVisible(False)
+        sim_layout.addRow(self.override_container)
 
         sim_btn_layout = QHBoxLayout()
         self.simulate_btn = QPushButton("Simulate")
@@ -295,10 +328,26 @@ class MainWindow(QMainWindow):
         if 0 <= row < len(self.filtered_rules):
             rule = self.filtered_rules[row]
             self.rule_detail.set_rule(rule)
+            self._populate_override_placeholders(rule)
             self._load_devices_for_rule(rule)
         else:
             self.rule_detail.set_rule(None)
         self._update_ui_state()
+
+    def _populate_override_placeholders(self, rule: Rule):
+        """Update placeholder text to show the rule's current values."""
+        comparator, thresholds = rule.threshold_info
+        thresh_str = ", ".join(str(t) for t in thresholds)
+        self.override_threshold.setPlaceholderText(
+            f"Current: {thresh_str} (blank = rule default)"
+        )
+        # Show current filter if any
+        fq = rule.params.get("filterQueryText", "")
+        if rule.rule_type == ".es-query":
+            fq = "(see rule query)"
+        self.override_filter.setPlaceholderText(
+            f"Current: {fq}" if fq else "KQL filter override (blank = rule default)"
+        )
 
     # ── Devices ─────────────────────────────────────────────────
 
@@ -338,6 +387,49 @@ class MainWindow(QMainWindow):
 
         self.statusbar.showMessage(f"{len(hosts)} devices found", 3000)
 
+    # ── What-If Overrides ───────────────────────────────────────
+
+    def _toggle_overrides(self, checked: bool):
+        self.override_container.setVisible(checked)
+        self.override_toggle.setText(
+            "▼ What-If Overrides" if checked else "▶ What-If Overrides"
+        )
+
+    def _reset_overrides(self):
+        self.override_comparator.setCurrentIndex(0)
+        self.override_threshold.clear()
+        self.override_filter.clear()
+
+    def _get_overrides(self) -> SimulationOverrides | None:
+        """Build SimulationOverrides from the UI fields, or None if nothing is set."""
+        comparator = None
+        threshold = None
+        filter_query = None
+
+        if self.override_comparator.currentIndex() > 0:
+            comparator = self.override_comparator.currentText()
+
+        thresh_text = self.override_threshold.text().strip()
+        if thresh_text:
+            try:
+                parts = [float(v.strip()) for v in thresh_text.split(",")]
+                threshold = parts
+            except ValueError:
+                pass  # ignore bad input, use rule default
+
+        filter_text = self.override_filter.text().strip()
+        if filter_text:
+            filter_query = filter_text
+
+        if comparator is None and threshold is None and filter_query is None:
+            return None
+
+        return SimulationOverrides(
+            threshold=threshold,
+            comparator=comparator,
+            filter_query=filter_query,
+        )
+
     # ── Simulation ──────────────────────────────────────────────
 
     def _get_selected_rule(self) -> Rule | None:
@@ -366,8 +458,10 @@ class MainWindow(QMainWindow):
         self.simulate_btn.setEnabled(False)
         self.simulate_all_btn.setEnabled(False)
 
+        overrides = self._get_overrides()
+
         def run():
-            return self.simulator.simulate(rule, host_name, time_seconds)
+            return self.simulator.simulate(rule, host_name, time_seconds, overrides)
 
         self._worker = WorkerThread(run)
         self._worker.finished.connect(self._on_simulation_done)
@@ -393,11 +487,13 @@ class MainWindow(QMainWindow):
         self.simulate_btn.setEnabled(False)
         self.simulate_all_btn.setEnabled(False)
 
+        overrides = self._get_overrides()
+
         def run():
             results = []
             for rule in rules_to_sim:
                 try:
-                    result = self.simulator.simulate(rule, host_name, time_seconds)
+                    result = self.simulator.simulate(rule, host_name, time_seconds, overrides)
                     results.append(result)
                 except Exception as e:
                     from .models import SimulationResult
@@ -418,9 +514,11 @@ class MainWindow(QMainWindow):
         self.simulate_all_btn.setEnabled(True)
         self.result_widget.set_result(result)
 
+        overrides = self._get_overrides()
+        override_tag = " [WHAT-IF]" if overrides else ""
         status = "WOULD FIRE" if result.fired else "OK"
         self.statusbar.showMessage(
-            f"Simulation complete: {result.rule.name} — {status}", 5000
+            f"Simulation complete{override_tag}: {result.rule.name} — {status}", 5000
         )
 
     def _on_simulation_all_done(self, results: list[SimulationResult]):

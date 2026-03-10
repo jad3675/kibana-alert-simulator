@@ -206,10 +206,16 @@ class SimulationResultWidget(QWidget):
                 return
 
         # Summary
+        override_banner = (
+            "<b style='color: #f39c12;'>⚡ WHAT-IF MODE</b> — "
+            "using overridden threshold/filter<br>"
+        ) if result.has_overrides else ""
+
         if result.fired:
             fired_count = sum(1 for d in result.device_results if d.fired)
             total_count = len(result.device_results)
             self.summary_label.setText(
+                f"{override_banner}"
                 f"<b style='color: #e74c3c;'>WOULD FIRE</b> — "
                 f"{fired_count} of {total_count} device(s) exceed threshold "
                 f"({comparator} {threshold_str})<br>"
@@ -217,6 +223,7 @@ class SimulationResultWidget(QWidget):
             )
         else:
             self.summary_label.setText(
+                f"{override_banner}"
                 f"<b style='color: #27ae60;'>WOULD NOT FIRE</b> — "
                 f"No devices exceed threshold ({comparator} {threshold_str})<br>"
                 f"<small>Time range: {result.time_range_start} to {result.time_range_end}</small>"
