@@ -91,7 +91,7 @@ class RuleDetailWidget(QWidget):
 
         self.info_text = QTextEdit()
         self.info_text.setReadOnly(True)
-        self.info_text.setMaximumHeight(200)
+        self.info_text.setMaximumHeight(300)
         layout.addWidget(self.info_text)
 
     def set_rule(self, rule: Rule | None):
@@ -109,6 +109,8 @@ class RuleDetailWidget(QWidget):
             else str(thresholds[0]) if thresholds else "N/A"
         )
 
+        params = rule.params
+
         lines = [
             f"<b>Type:</b> {rule.display_type}",
             f"<b>Enabled:</b> {'Yes' if rule.enabled else 'No'}",
@@ -118,28 +120,70 @@ class RuleDetailWidget(QWidget):
             f"<b>Tags:</b> {', '.join(rule.tags) if rule.tags else 'None'}",
         ]
 
-        # Show query/params summary
-        params = rule.params
+        # ── Type-specific details ──
+
         if rule.rule_type == ".es-query":
+            search_type = params.get("searchType", "esQuery")
+            lines.append(f"<b>Search Type:</b> {search_type}")
             query = params.get("esQuery", "")
-            if isinstance(query, str) and len(query) > 200:
-                query = query[:200] + "..."
+            if isinstance(query, str) and len(query) > 300:
+                query = query[:300] + "..."
             elif isinstance(query, dict):
-                query = json.dumps(query, indent=2)[:200] + "..."
+                query = json.dumps(query, indent=2)[:300] + "..."
             lines.append(f"<b>Query:</b><pre>{query}</pre>")
+            size = params.get("size", "")
+            if size:
+                lines.append(f"<b>Size:</b> {size}")
+
         elif rule.rule_type == ".index-threshold":
             agg = params.get("aggType", "count")
             agg_field = params.get("aggField", "")
+            group_by = params.get("groupBy", "all")
+            term_field = params.get("termField", "")
+            term_size = params.get("termSize", "")
             lines.append(f"<b>Aggregation:</b> {agg}({agg_field or '*'})")
+            lines.append(f"<b>Group By:</b> {group_by}")
+            if term_field:
+                lines.append(f"<b>Term Field:</b> {term_field} (top {term_size})")
+
         elif rule.rule_type == "metrics.alert.threshold":
             criteria = rule.criteria
             for i, c in enumerate(criteria):
                 metric = c.get("metric", "custom")
                 agg = c.get("aggType", "avg")
-                lines.append(f"<b>Criterion {i+1}:</b> {agg}({metric})")
+                cmp = c.get("comparator", ">")
+                thresh = c.get("threshold", [])
+                thresh_s = ", ".join(str(t) for t in thresh) if isinstance(thresh, list) else str(thresh)
+                ts = c.get("timeSize", "")
+                tu = c.get("timeUnit", "")
+                time_s = f" over {ts}{tu}" if ts else ""
+                lines.append(
+                    f"<b>Criterion {i+1}:</b> {agg}({metric}) {cmp} {thresh_s}{time_s}"
+                )
+                if metric == "custom":
+                    custom = c.get("customMetrics", [])
+                    for cm in custom:
+                        lines.append(
+                            f"&nbsp;&nbsp;Custom: {cm.get('aggType', '?')}({cm.get('field', '?')})"
+                        )
             filter_text = params.get("filterQueryText", "")
             if filter_text:
-                lines.append(f"<b>Filter:</b> {filter_text}")
+                lines.append(f"<b>KQL Filter:</b> <code>{filter_text}</code>")
+            else:
+                lines.append(f"<b>KQL Filter:</b> <i>(none)</i>")
+            filter_kql = params.get("filterQuery", "")
+            if filter_kql and filter_kql != filter_text:
+                lines.append(f"<b>Filter Query:</b> <code>{filter_kql}</code>")
+            group_by = params.get("groupBy", [])
+            if group_by:
+                lines.append(f"<b>Group By:</b> {', '.join(group_by)}")
+            alert_on_no_data = params.get("alertOnNoData", False)
+            alert_on_group_disappear = params.get("alertOnGroupDisappear", False)
+            if alert_on_no_data:
+                lines.append("<b>Alert on no data:</b> Yes")
+            if alert_on_group_disappear:
+                lines.append("<b>Alert on group disappear:</b> Yes")
+
         elif rule.rule_type == "logs.alert.document.count":
             criteria = rule.criteria
             for i, c in enumerate(criteria):
@@ -147,7 +191,35 @@ class RuleDetailWidget(QWidget):
                 cmp = c.get("comparator", "")
                 val = c.get("value", "")
                 lines.append(f"<b>Criterion {i+1}:</b> {field} {cmp} {val}")
+            count_params = params.get("count", {})
+            if count_params:
+                cmp = count_params.get("comparator", "")
+                val = count_params.get("value", "")
+                lines.append(f"<b>Count:</b> {cmp} {val}")
 
+        elif rule.rule_type == "metrics.alert.inventory.threshold":
+            criteria = rule.criteria
+            for i, c in enumerate(criteria):
+                metric = c.get("metric", "")
+                cmp = c.get("comparator", "")
+                thresh = c.get("threshold", "")
+                lines.append(f"<b>Criterion {i+1}:</b> {metric} {cmp} {thresh}")
+            node_type = params.get("nodeType", "")
+            if node_type:
+                lines.append(f"<b>Node Type:</b> {node_type}")
+
+        else:
+            # Generic: dump key params
+            skip_keys = {"index", "threshold", "thresholdComparator"}
+            for k, v in params.items():
+                if k in skip_keys:
+                    continue
+                val_str = str(v)
+                if len(val_str) > 120:
+                    val_str = val_str[:120] + "..."
+                lines.append(f"<b>{k}:</b> {val_str}")
+
+        # ── Time window ──
         tw = params.get("timeWindowSize")
         tu = params.get("timeWindowUnit")
         if tw and tu:
@@ -155,6 +227,11 @@ class RuleDetailWidget(QWidget):
         elif rule.time_window_seconds:
             mins = rule.time_window_seconds // 60
             lines.append(f"<b>Time Window:</b> {mins} minutes")
+
+        # ── Actions summary ──
+        if rule.actions:
+            action_types = [a.get("actionTypeId", a.get("group", "?")) for a in rule.actions]
+            lines.append(f"<b>Actions:</b> {len(rule.actions)} ({', '.join(action_types)})")
 
         self.info_text.setHtml("<br>".join(lines))
 

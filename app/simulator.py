@@ -471,16 +471,18 @@ class RuleSimulator:
     @staticmethod
     def _extract_metric_value(result: dict, agg_type: str) -> float:
         if agg_type == "count":
-            return float(result["total"])
+            return float(result.get("total", 0) or 0)
         metric = result.get("aggregations", {}).get("metric", {})
-        return float(metric.get("value", 0))
+        val = metric.get("value")
+        return float(val) if val is not None else 0.0
 
     @staticmethod
     def _extract_bucket_value(bucket: dict, agg_type: str) -> float:
         if agg_type == "count":
-            return float(bucket["doc_count"])
+            return float(bucket.get("doc_count", 0) or 0)
         metric = bucket.get("metric", {})
-        return float(metric.get("value", 0))
+        val = metric.get("value")
+        return float(val) if val is not None else 0.0
 
     @staticmethod
     def _check_threshold(value: float, comparator: str, thresholds: list[float]) -> bool:
