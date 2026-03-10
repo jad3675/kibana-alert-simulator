@@ -143,9 +143,10 @@ class SimulationResult:
     error: str | None = None
     has_overrides: bool = False
 
-    @dataclass
-    class SimulationOverrides:
-        """What-if overrides for simulation without modifying the real rule."""
-        threshold: list[float] | None = None
-        comparator: str | None = None
-        filter_query: str | None = None  # KQL / query_string override
+
+@dataclass
+class SimulationOverrides:
+    """What-if overrides for simulation without modifying the real rule."""
+    threshold: list[float] | None = None
+    comparator: str | None = None
+    filter_query: str | None = None  # KQL / query_string override
